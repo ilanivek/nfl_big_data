@@ -46,7 +46,18 @@ def _field_shapes() -> list[dict]:
     return shapes
 
 
-def _frame_traces(frame_df: pd.DataFrame, pocket_fn=None) -> list[go.Scatter]:
+def _pressure_color(distance: float) -> str:
+    """Green (clear) -> yellow -> red (pressure) by QB-to-rusher distance."""
+    # 6+ yd = clear/green, 2 yd or less = red. Linear blend in between.
+    clear, pressure = 6.0, 2.0
+    t = max(0.0, min((distance - pressure) / (clear - pressure), 1.0))
+    # t=1 green, t=0 red.
+    r = int(255 * (1 - t))
+    g = int(180 * t + 40 * (1 - t))
+    return f"rgb({r},{g},40)"
+
+
+def _frame_traces(frame_df: pd.DataFrame, pocket_fn=None, pressure_fn=None) -> list[go.Scatter]:
     """Build the scatter traces for a single frame."""
     off = frame_df[frame_df["team"] == "OFF"] if "OFF" in frame_df["team"].values \
         else frame_df[(frame_df["team"] != "football") & (frame_df["team"].notna())]
@@ -81,7 +92,9 @@ def _frame_traces(frame_df: pd.DataFrame, pocket_fn=None) -> list[go.Scatter]:
             name="ball", hoverinfo="skip",
         ))
 
-    # Optional pocket polygon from Person C.
+    # Optional pocket polygon from Person C — now the SECONDARY visual (shows
+    # the offensive line's shape). Kept faint so it doesn't compete with the
+    # pressure line below. Inserted at index 0 so it sits behind everything.
     if pocket_fn is not None:
         try:
             poly = pocket_fn(frame_df)
@@ -90,12 +103,40 @@ def _frame_traces(frame_df: pd.DataFrame, pocket_fn=None) -> list[go.Scatter]:
                 ys = [p[1] for p in poly] + [poly[0][1]]
                 traces.insert(0, go.Scatter(
                     x=xs, y=ys, mode="lines", fill="toself",
-                    fillcolor="rgba(255,255,0,0.25)", line=dict(color="yellow", width=1),
+                    fillcolor="rgba(255,221,0,0.18)",
+                    line=dict(color="rgba(255,221,0,0.6)", width=1),
                     name="pocket", hoverinfo="skip",
                 ))
         except Exception:
             # Pocket is additive; never let it break the replay.
             pass
+
+    # Optional pressure line from Person C — the PRIMARY story. A line from the
+    # QB to the nearest rusher, colored green (clear) -> red (pressure), with a
+    # distance label. This is the visual twin of the integrity score.
+    if pressure_fn is not None:
+        link = None
+        try:
+            link = pressure_fn(frame_df)
+        except Exception:
+            link = None
+        if link is not None:
+            (qx, qy), (rx, ry) = link["qb"], link["rusher"]
+            dist = link["distance"]
+            color = _pressure_color(dist)
+            traces.append(go.Scatter(
+                x=[qx, rx], y=[qy, ry], mode="lines+markers+text",
+                line=dict(color=color, width=4),
+                marker=dict(size=6, color=color),
+                text=["", f"{dist:.1f} yd"], textposition="top center",
+                textfont=dict(size=11, color=color),
+                name="pressure", hoverinfo="skip",
+            ))
+        else:
+            # Emit an empty placeholder so the trace count stays constant across
+            # frames (Plotly animations map data to traces by position).
+            traces.append(go.Scatter(x=[], y=[], mode="lines",
+                                     name="pressure", hoverinfo="skip"))
 
     return traces
 
@@ -111,15 +152,19 @@ def _frame_label(frame_df: pd.DataFrame, meta: dict, fid: int) -> str:
     return f"{secs}{event_txt}"
 
 
-def build_field_figure(bundle: dict, pocket_fn=None) -> go.Figure:
-    """Build the animated replay figure from a play bundle."""
+def build_field_figure(bundle: dict, pocket_fn=None, pressure_fn=None) -> go.Figure:
+    """Build the animated replay figure from a play bundle.
+
+    pocket_fn: optional, draws the (faint) offensive-line hull.
+    pressure_fn: optional, draws the QB-to-nearest-rusher pressure line.
+    """
     frames_df = bundle["frames"]
     meta = bundle.get("meta", {})
     frame_ids = sorted(frames_df["frameId"].unique())
 
     # Initial frame.
     first = frames_df[frames_df["frameId"] == frame_ids[0]]
-    fig = go.Figure(data=_frame_traces(first, pocket_fn))
+    fig = go.Figure(data=_frame_traces(first, pocket_fn, pressure_fn))
 
     # Animation frames — each carries its own per-frame caption so the viewer
     # always knows how far into the play they are and what just happened.
@@ -127,7 +172,7 @@ def build_field_figure(bundle: dict, pocket_fn=None) -> go.Figure:
     for fid in frame_ids:
         fdf = frames_df[frames_df["frameId"] == fid]
         anim_frames.append(go.Frame(
-            data=_frame_traces(fdf, pocket_fn),
+            data=_frame_traces(fdf, pocket_fn, pressure_fn),
             name=str(fid),
             layout=go.Layout(
                 title=dict(text=_frame_label(fdf, meta, fid), x=0.5,

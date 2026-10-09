@@ -118,11 +118,18 @@ col4.metric("Throw frame", meta.get("throw_frame") or "—")
 # --------------------------------------------------------------------------
 # The replay (Person B figure + Person C pocket overlay)
 # --------------------------------------------------------------------------
-show_pocket = st.sidebar.checkbox("Show pocket", value=True)
+show_pressure = st.sidebar.checkbox("Show pressure line (QB → nearest rusher)", value=True)
+show_pocket = st.sidebar.checkbox("Show pocket (O-line shape)", value=True)
 fig = field.build_field_figure(
-    bundle, pocket_fn=pocket.pocket_shape if show_pocket else None
+    bundle,
+    pocket_fn=pocket.pocket_shape if show_pocket else None,
+    pressure_fn=pocket.pressure_link if show_pressure else None,
 )
 st.plotly_chart(fig, use_container_width=True)
+st.caption(
+    "Gold outline = offensive line shape. Colored line = distance from QB to the "
+    "nearest pass rusher (green = clean, red = pressure) — the signal behind the score."
+)
 
 # --- Live pocket integrity over the play (Person C) -----------------------
 with st.expander("📉 Pocket integrity over the play", expanded=True):

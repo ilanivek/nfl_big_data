@@ -120,6 +120,28 @@ def nearest_rusher_distance(frame_df: pd.DataFrame) -> float | None:
     return float(d.min())
 
 
+def pressure_link(frame_df: pd.DataFrame) -> dict | None:
+    """Geometry for the QB-to-nearest-rusher 'pressure line' this frame.
+
+    Returns {qb: (x,y), rusher: (x,y), distance: float} for the closest rusher,
+    or None if QB/rushers aren't identifiable. The field layer uses this to draw
+    a line whose color encodes how close pressure is — the visual twin of the
+    integrity score.
+    """
+    qb = qb_position(frame_df)
+    rushers = _players_by_role(frame_df, RUSHER_ROLES)[["x", "y"]].dropna()
+    if qb is None or rushers.empty:
+        return None
+    qx, qy = qb
+    d = ((rushers["x"] - qx) ** 2 + (rushers["y"] - qy) ** 2) ** 0.5
+    i = d.idxmin()
+    return {
+        "qb": (qx, qy),
+        "rusher": (float(rushers.loc[i, "x"]), float(rushers.loc[i, "y"])),
+        "distance": float(d.loc[i]),
+    }
+
+
 def pocket_shape(frame_df: pd.DataFrame) -> list[tuple[float, float]]:
     """Convex hull of the pass blockers — the visible 'pocket'.
 
