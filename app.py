@@ -50,11 +50,35 @@ else:
 meta = bundle["meta"]
 st.caption(meta["playDescription"])
 
-col1, col2, col3 = st.columns(3)
+# Situation line: "TB ball — 3rd & 7, Q2 02:00" (skips any missing pieces).
+PASS_RESULT_LABELS = {
+    "C": "Complete", "I": "Incomplete", "S": "Sack",
+    "IN": "Interception", "R": "Scramble",
+}
+
+
+def _ordinal(n):
+    return {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(n, f"{n}th")
+
+
+situation_bits = []
+if meta.get("possessionTeam"):
+    situation_bits.append(f"{meta['possessionTeam']} ball")
+if meta.get("down") and meta.get("yardsToGo") is not None:
+    situation_bits.append(f"{_ordinal(int(meta['down']))} & {int(meta['yardsToGo'])}")
+if meta.get("quarter"):
+    clock = f" {meta['gameClock']}" if meta.get("gameClock") else ""
+    situation_bits.append(f"Q{int(meta['quarter'])}{clock}")
+if situation_bits:
+    st.markdown(" — ".join(situation_bits))
+
+col1, col2, col3, col4 = st.columns(4)
 ttt = pocket.time_to_throw(meta)
 col1.metric("Time to throw", f"{ttt:.1f}s" if ttt is not None else "—")
-col2.metric("Snap frame", meta.get("snap_frame") or "—")
-col3.metric("Throw frame", meta.get("throw_frame") or "—")
+outcome = PASS_RESULT_LABELS.get(meta.get("passResult"), meta.get("passResult") or "—")
+col2.metric("Outcome", outcome)
+col3.metric("Snap frame", meta.get("snap_frame") or "—")
+col4.metric("Throw frame", meta.get("throw_frame") or "—")
 
 # --------------------------------------------------------------------------
 # The replay (Person B figure + Person C pocket overlay)

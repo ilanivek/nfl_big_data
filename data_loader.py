@@ -50,6 +50,12 @@ def load_plays() -> pd.DataFrame:
     return pd.read_csv(os.path.join(DATA_DIR, "plays.csv"))
 
 
+@lru_cache(maxsize=1)
+def load_pff_scouting() -> pd.DataFrame:
+    """pffScoutingData.csv — one row per player per play (roles, block info)."""
+    return pd.read_csv(os.path.join(DATA_DIR, "pffScoutingData.csv"))
+
+
 @lru_cache(maxsize=16)
 def load_tracking(game_id: int) -> pd.DataFrame:
     """tracking_[gameId].csv — one row per player per frame for a single game."""
@@ -106,9 +112,19 @@ def get_play_bundle(game_id: int, play_id: int) -> dict:
         (tracking["gameId"] == game_id) & (tracking["playId"] == play_id)
     ].copy()
 
+    # Attach each player's role on this play (Pass block / Pass / Pass rush /
+    # Pass route / Coverage) so Person C can build the pocket hull from just the
+    # pass blockers. Role is per-play, so it broadcasts across every frame.
+    # The ball (nflId = NaN) won't match and gets a NaN role — expected.
+    roles = load_pff_scouting()
+    roles = roles[
+        (roles["gameId"] == game_id) & (roles["playId"] == play_id)
+    ][["nflId", "pff_role"]]
+    frames = frames.merge(roles, on="nflId", how="left")
+
     keep = [
         "frameId", "nflId", "team", "jerseyNumber",
-        "x", "y", "s", "o", "dir", "event",
+        "x", "y", "s", "o", "dir", "event", "pff_role",
     ]
     frames = frames[keep].sort_values(["frameId", "nflId"]).reset_index(drop=True)
 
@@ -121,6 +137,13 @@ def get_play_bundle(game_id: int, play_id: int) -> dict:
         tracking.loc[tracking["playId"] == play_id, "playDirection"].iloc[0]
     )
 
+    def _play_field(col):
+        """Safely pull a scalar play-level field; None if absent/missing."""
+        if play_row.empty or col not in play_row:
+            return None
+        val = play_row[col].iloc[0]
+        return None if pd.isna(val) else val
+
     return {
         "frames": frames,
         "meta": {
@@ -130,6 +153,15 @@ def get_play_bundle(game_id: int, play_id: int) -> dict:
             "playDirection": play_direction,
             "gameId": game_id,
             "playId": play_id,
+            # Possession tagging (unblocks Person B: color offense vs defense).
+            "possessionTeam": _play_field("possessionTeam"),
+            "defensiveTeam": _play_field("defensiveTeam"),
+            # Broadcaster caption / outcome fields.
+            "passResult": _play_field("passResult"),
+            "down": _play_field("down"),
+            "yardsToGo": _play_field("yardsToGo"),
+            "quarter": _play_field("quarter"),
+            "gameClock": _play_field("gameClock"),
         },
     }
 
@@ -155,18 +187,22 @@ def mock_bundle() -> dict:
         # QB drifts back a touch.
         rows.append(dict(frameId=f, nflId=1, team="OFF", jerseyNumber=12,
                          x=qb_start[0] - t * 2, y=qb_start[1], s=1.0, o=90, dir=270,
-                         event="ball_snap" if f == 5 else ("pass_forward" if f == 32 else "None")))
+                         event="ball_snap" if f == 5 else ("pass_forward" if f == 32 else "None"),
+                         pff_role="Pass"))
         for i, (ox, oy) in enumerate(ol_start):
             rows.append(dict(frameId=f, nflId=10 + i, team="OFF", jerseyNumber=70 + i,
-                             x=ox - t * 1.0, y=oy, s=0.8, o=90, dir=270, event="None"))
+                             x=ox - t * 1.0, y=oy, s=0.8, o=90, dir=270, event="None",
+                             pff_role="Pass block"))
         for j, (rx, ry) in enumerate(rush_start):
             # rushers converge toward the QB
             rows.append(dict(frameId=f, nflId=20 + j, team="DEF", jerseyNumber=90 + j,
                              x=rx - t * 3.0, y=ry + (24 - ry) * t * 0.6,
-                             s=2.0, o=270, dir=90, event="None"))
-        # ball tracks with QB
+                             s=2.0, o=270, dir=90, event="None",
+                             pff_role="Pass rush"))
+        # ball tracks with QB (no role — not a player)
         rows.append(dict(frameId=f, nflId=np.nan, team="football", jerseyNumber=np.nan,
-                         x=qb_start[0] - t * 2, y=qb_start[1], s=0.0, o=0, dir=0, event="None"))
+                         x=qb_start[0] - t * 2, y=qb_start[1], s=0.0, o=0, dir=0, event="None",
+                         pff_role=np.nan))
 
     frames = pd.DataFrame(rows)
     return {
@@ -178,6 +214,15 @@ def mock_bundle() -> dict:
             "playDirection": "left",
             "gameId": 0,
             "playId": 0,
+            # Mock uses OFF/DEF team tags; mirror them here so B's offense/defense
+            # coloring keys on the same values in mock and real mode.
+            "possessionTeam": "OFF",
+            "defensiveTeam": "DEF",
+            "passResult": "S",   # ends in a sack — the pocket collapsed
+            "down": 3,
+            "yardsToGo": 7,
+            "quarter": 2,
+            "gameClock": "02:00",
         },
     }
 
