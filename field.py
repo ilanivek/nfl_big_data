@@ -26,7 +26,7 @@ TEAM_COLORS = {
 }
 OFFENSE_COLOR = "#1f77b4"  # blue
 DEFENSE_COLOR = "#d62728"  # red
-BALL_COLOR = "#8B4513"
+BALL_COLOR = "#ff7f0e"  # orange
 
 
 def _field_shapes() -> list[dict]:
@@ -46,38 +46,63 @@ def _field_shapes() -> list[dict]:
     return shapes
 
 
-def _frame_traces(frame_df: pd.DataFrame, pocket_fn=None) -> list[go.Scatter]:
-    """Build the scatter traces for a single frame."""
-    off = frame_df[frame_df["team"] == "OFF"] if "OFF" in frame_df["team"].values \
-        else frame_df[(frame_df["team"] != "football") & (frame_df["team"].notna())]
-    # In real data, team is an abbreviation (e.g. "TB"/"DAL"), not OFF/DEF.
-    # We split by the two non-football teams; offense vs defense coloring can be
-    # refined once Person A tags possession. For now: football is brown, and the
-    # two teams get blue/red by first-seen order.
+def _team_colors(teams: list, meta: dict) -> dict:
+    """Map each team tag to a color using possession info from meta.
+
+    `meta["possessionTeam"]` is the offense and `meta["defensiveTeam"]` the
+    defense. These are "OFF"/"DEF" in the mock bundle and real abbreviations
+    (e.g. "TB"/"DAL") in real data, so keying on them works in both modes.
+    Any team not matched (shouldn't happen) falls back to a neutral palette so
+    the replay never crashes.
+    """
+    possession = meta.get("possessionTeam")
+    defense = meta.get("defensiveTeam")
+    color_for = {}
+    fallback = ["#ff7f0e", "#9467bd"]
+    fi = 0
+    for t in teams:
+        if possession is not None and t == possession:
+            color_for[t] = OFFENSE_COLOR
+        elif defense is not None and t == defense:
+            color_for[t] = DEFENSE_COLOR
+        else:
+            # Unknown team (missing possession info): neutral, but still distinct.
+            color_for[t] = fallback[fi % len(fallback)]
+            fi += 1
+    return color_for
+
+
+def _frame_traces(frame_df: pd.DataFrame, pocket_fn=None, meta: dict | None = None) -> list[go.Scatter]:
+    """Build the scatter traces for a single frame.
+
+    Offense is colored blue and defense red by matching each row's `team`
+    against `meta["possessionTeam"]`/`meta["defensiveTeam"]`. Works for both the
+    mock bundle (OFF/DEF) and real data (team abbreviations).
+    """
+    meta = meta or {}
     traces = []
 
     ball = frame_df[frame_df["team"] == "football"]
     non_ball = frame_df[frame_df["team"] != "football"]
     teams = [t for t in non_ball["team"].dropna().unique()]
-    color_for = {}
-    palette = [OFFENSE_COLOR, DEFENSE_COLOR, "#ff7f0e", "#9467bd"]
-    for i, t in enumerate(teams):
-        color_for[t] = palette[i % len(palette)]
+    color_for = _team_colors(teams, meta)
 
     for t in teams:
         grp = non_ball[non_ball["team"] == t]
+        is_offense = t == meta.get("possessionTeam")
         traces.append(go.Scatter(
             x=grp["x"], y=grp["y"], mode="markers+text",
-            marker=dict(size=14, color=color_for[t], line=dict(color="white", width=1)),
+            marker=dict(size=20, color=color_for[t], symbol="square",
+                        line=dict(color="white", width=1)),
             text=grp["jerseyNumber"].fillna("").astype(str).str.replace(".0", "", regex=False),
-            textposition="middle center", textfont=dict(size=8, color="white"),
-            name=str(t), hoverinfo="text",
+            textposition="middle center", textfont=dict(size=11, color="white"),
+            name=f"{t} (offense)" if is_offense else str(t), hoverinfo="text",
         ))
 
     if not ball.empty:
         traces.append(go.Scatter(
             x=ball["x"], y=ball["y"], mode="markers",
-            marker=dict(size=9, color=BALL_COLOR, symbol="diamond"),
+            marker=dict(size=13, color=BALL_COLOR, symbol="circle"),
             name="ball", hoverinfo="skip",
         ))
 
@@ -119,7 +144,7 @@ def build_field_figure(bundle: dict, pocket_fn=None) -> go.Figure:
 
     # Initial frame.
     first = frames_df[frames_df["frameId"] == frame_ids[0]]
-    fig = go.Figure(data=_frame_traces(first, pocket_fn))
+    fig = go.Figure(data=_frame_traces(first, pocket_fn, meta))
 
     # Animation frames — each carries its own per-frame caption so the viewer
     # always knows how far into the play they are and what just happened.
@@ -127,7 +152,7 @@ def build_field_figure(bundle: dict, pocket_fn=None) -> go.Figure:
     for fid in frame_ids:
         fdf = frames_df[frames_df["frameId"] == fid]
         anim_frames.append(go.Frame(
-            data=_frame_traces(fdf, pocket_fn),
+            data=_frame_traces(fdf, pocket_fn, meta),
             name=str(fid),
             layout=go.Layout(
                 title=dict(text=_frame_label(fdf, meta, fid), x=0.5,
@@ -157,17 +182,18 @@ def build_field_figure(bundle: dict, pocket_fn=None) -> go.Figure:
         yaxis=dict(range=[0, FIELD_WIDTH], showgrid=False, zeroline=False,
                    visible=False, scaleanchor="x", scaleratio=1),
         plot_bgcolor="#2e7d32", paper_bgcolor="white",
-        margin=dict(l=10, r=10, t=40, b=10), height=430,
+        margin=dict(l=10, r=10, t=40, b=10), height=650,
         showlegend=False,
         updatemenus=[dict(
             type="buttons", showactive=False, x=0.05, y=1.15,
             buttons=[
-                dict(label="▶ Play", method="animate",
+                # Single toggle: Plotly alternates between `args` (play) and
+                # `args2` (pause) on each click, so one button does both.
+                dict(label="▶ / ⏸", method="animate",
                      args=[None, dict(frame=dict(duration=100, redraw=True),
-                                      fromcurrent=True)]),
-                dict(label="⏸ Pause", method="animate",
-                     args=[[None], dict(frame=dict(duration=0, redraw=False),
-                                        mode="immediate")]),
+                                      fromcurrent=True)],
+                     args2=[[None], dict(frame=dict(duration=0, redraw=False),
+                                         mode="immediate")]),
             ],
         )],
         sliders=[dict(
