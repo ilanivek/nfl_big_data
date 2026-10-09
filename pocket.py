@@ -26,10 +26,13 @@ FRAMES_PER_SECOND = 10.0
 ROLE_COLUMNS = ("role", "pff_role")
 
 # pff_role values that identify a pass blocker — the players who form the pocket.
-BLOCKER_ROLES = {"Pass block", "Pass"}  # include the QB ("Pass"); drop him via QB_ONLY below if desired
+# NOTE: matched case-insensitively (see _offensive_players). The README documents
+# these as "Pass block"/"Pass", but the actual CSV ships "Pass Block"/"Pass" —
+# so we normalize to lowercase before comparing to avoid a casing mismatch.
+BLOCKER_ROLES = {"pass block", "pass"}  # include the QB ("pass")
 
 # Just the blockers (no QB), for the tightest pocket.
-PASS_BLOCK_ROLES = {"Pass block"}
+PASS_BLOCK_ROLES = {"pass block"}
 
 
 def _role_column(frame_df: pd.DataFrame) -> str | None:
@@ -59,7 +62,10 @@ def _offensive_players(frame_df: pd.DataFrame, blockers_only: bool = True) -> pd
     role_col = _role_column(frame_df)
     if role_col is not None:
         wanted = PASS_BLOCK_ROLES if blockers_only else BLOCKER_ROLES
-        blockers = non_ball[non_ball[role_col].isin(wanted)]
+        # Case-insensitive match: the CSV ships "Pass Block" but the README says
+        # "Pass block". Normalize both sides to lowercase so either works.
+        role_norm = non_ball[role_col].astype(str).str.strip().str.lower()
+        blockers = non_ball[role_norm.isin(wanted)]
         # Only trust the role filter if it actually found blockers; otherwise
         # fall through so a sparse/odd play still renders something.
         if len(blockers) >= 3:
@@ -149,3 +155,137 @@ def pressure_moment(bundle: dict, threshold: float = 10.0) -> dict | None:
         return None
     row = collapsed.iloc[0]
     return {"frameId": int(row["frameId"]), "seconds": row["seconds"], "area": row["area"]}
+
+
+# --------------------------------------------------------------------------
+# Pocket Integrity Score — the headline metric
+# --------------------------------------------------------------------------
+# A single 0-100 grade for how well the offensive line protected the QB on a
+# play. It blends three things a coach actually cares about, each scored 0-1
+# then weighted:
+#   1. TIME HELD   (45%) — how long the pocket survived before the throw/sack.
+#                  2.5s is "clean"; under ~1.5s is a quick loss.
+#   2. RETENTION   (35%) — pocket area at the throw vs. its post-snap peak.
+#                  A pocket that keeps its space protects better than one that
+#                  caves in, even if both last the same time.
+#   3. STABILITY   (20%) — how steadily it held vs. collapsing in a rush.
+#                  Measured as the worst (min) area as a share of the peak.
+# Weights are tunable; these are sensible hackathon defaults, not gospel.
+
+SCORE_WEIGHTS = {"time": 0.45, "retention": 0.35, "stability": 0.20}
+
+# Time-held normalization: seconds that map to a "full marks" pocket.
+IDEAL_TIME_TO_THROW = 2.5
+
+# Outcome multiplier applied to the blended score. Protection that ends in a
+# sack failed by definition, no matter how long it lasted, so we cap it hard.
+# A hit/hurry is a partial failure; a clean pass/scramble keeps full credit.
+#   S = sack, IN = interception (often pressure-driven), I = incomplete,
+#   C = complete, R = scramble.
+OUTCOME_MULTIPLIER = {
+    "S": 0.35,   # sack — protection broke down
+    "IN": 0.80,  # interception — not purely an OL failure
+    "I": 0.95,   # incomplete — mostly on the throw, not protection
+    "C": 1.00,   # complete — protection did its job
+    "R": 0.90,   # scramble — QB had to leave a breaking pocket
+}
+
+
+def _post_snap_series(bundle: dict) -> pd.DataFrame:
+    """Area series restricted to snap..throw (the window that matters)."""
+    series = pocket_area_series(bundle)
+    meta = bundle["meta"]
+    snap, throw = meta.get("snap_frame"), meta.get("throw_frame")
+    if snap is not None:
+        series = series[series["frameId"] >= snap]
+    if throw is not None:
+        series = series[series["frameId"] <= throw]
+    return series.reset_index(drop=True)
+
+
+def pocket_integrity_score(bundle: dict) -> dict:
+    """Compute the 0-100 Pocket Integrity Score for a play.
+
+    Returns a dict with the overall `score` plus the three component sub-scores
+    (0-100 each) and the raw numbers behind them, so the UI can show a
+    breakdown rather than an unexplained number.
+    """
+    series = _post_snap_series(bundle)
+    if series.empty or series["area"].max() <= 0:
+        return {
+            "score": None,
+            "components": {"time": None, "retention": None, "stability": None},
+            "detail": {"reason": "pocket not computable for this play"},
+        }
+
+    peak = float(series["area"].max())
+    area_at_throw = float(series["area"].iloc[-1])
+    area_min = float(series["area"].min())
+
+    # 1. Time held (clamped 0..1 against the ideal).
+    ttt = time_to_throw(bundle["meta"])
+    time_component = min(ttt / IDEAL_TIME_TO_THROW, 1.0) if ttt is not None else 0.5
+
+    # 2. Retention: area kept at the throw vs. the peak.
+    retention_component = max(0.0, min(area_at_throw / peak, 1.0))
+
+    # 3. Stability: worst area vs. peak (penalizes a deep collapse mid-play).
+    stability_component = max(0.0, min(area_min / peak, 1.0))
+
+    components01 = {
+        "time": time_component,
+        "retention": retention_component,
+        "stability": stability_component,
+    }
+    blended = sum(SCORE_WEIGHTS[k] * v for k, v in components01.items())
+
+    # Apply the play-outcome multiplier so a sack can't score as "good" protection.
+    outcome = bundle["meta"].get("passResult")
+    mult = OUTCOME_MULTIPLIER.get(outcome, 1.0)
+    overall = blended * mult
+
+    return {
+        "score": round(overall * 100, 1),
+        "components": {k: round(v * 100, 1) for k, v in components01.items()},
+        "detail": {
+            "time_to_throw_s": ttt,
+            "peak_area": round(peak, 1),
+            "area_at_throw": round(area_at_throw, 1),
+            "min_area": round(area_min, 1),
+            "outcome": outcome,
+            "outcome_multiplier": mult,
+            "grade": _letter_grade(overall * 100),
+        },
+    }
+
+
+def _letter_grade(score: float) -> str:
+    """A quick letter grade for the demo (A protection ... F got crushed)."""
+    if score >= 85:
+        return "A"
+    if score >= 70:
+        return "B"
+    if score >= 55:
+        return "C"
+    if score >= 40:
+        return "D"
+    return "F"
+
+
+def integrity_trace(bundle: dict) -> pd.DataFrame:
+    """Per-frame 'live' pocket integrity (0-100), for a running gauge.
+
+    Integrity at a frame = current area as a percentage of the post-snap peak
+    area, so it starts near 100 right after the snap and falls as the pocket
+    collapses. Columns: [frameId, seconds, integrity].
+    """
+    series = pocket_area_series(bundle)
+    post = _post_snap_series(bundle)
+    peak = float(post["area"].max()) if not post.empty and post["area"].max() > 0 else None
+    if peak is None:
+        series = series.assign(integrity=float("nan"))
+        return series[["frameId", "seconds", "integrity"]]
+    series = series.assign(
+        integrity=(series["area"] / peak * 100).clip(lower=0, upper=100)
+    )
+    return series[["frameId", "seconds", "integrity"]]
