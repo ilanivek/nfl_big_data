@@ -1,0 +1,17 @@
+# Data — too big for GitHub (~825 MB), lives locally on each machine
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+.env
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
