@@ -21,29 +21,22 @@ st.caption("Grading NFL pass protection, one snap at a time.")
 # --------------------------------------------------------------------------
 # Sidebar: data source + play selection
 # --------------------------------------------------------------------------
-use_mock = st.sidebar.checkbox("Use mock data (no CSVs needed)", value=False)
-
 bundle = None
-if use_mock:
-    bundle = dl.mock_bundle()
-    st.sidebar.info("Showing synthetic play. Uncheck to use real data.")
-else:
-    try:
-        games = dl.game_options()
-        game_label = st.sidebar.selectbox("Game", games["label"])
-        game_id = int(games.loc[games["label"] == game_label, "gameId"].iloc[0])
+try:
+    games = dl.game_options()
+    game_label = st.sidebar.selectbox("Game", games["label"])
+    game_id = int(games.loc[games["label"] == game_label, "gameId"].iloc[0])
 
-        plays = dl.play_options(game_id)
-        play_label = st.sidebar.selectbox("Play", plays["label"])
-        play_id = int(plays.loc[plays["label"] == play_label, "playId"].iloc[0])
+    plays = dl.play_options(game_id)
+    play_label = st.sidebar.selectbox("Play", plays["label"])
+    play_id = int(plays.loc[plays["label"] == play_label, "playId"].iloc[0])
 
-        bundle = dl.get_play_bundle(game_id, play_id)
-    except FileNotFoundError:
-        st.error(
-            "Data files not found. Place the `data/` folder in the project root, "
-            "or tick 'Use mock data' in the sidebar."
-        )
-        st.stop()
+    bundle = dl.get_play_bundle(game_id, play_id)
+except FileNotFoundError:
+    st.error(
+        "Data files not found. Place the `data/` folder in the project root."
+    )
+    st.stop()
 
 # --------------------------------------------------------------------------
 # Header stats (Person C)
@@ -72,6 +65,25 @@ if meta.get("quarter"):
     situation_bits.append(f"Q{int(meta['quarter'])}{clock}")
 if situation_bits:
     st.markdown(" — ".join(situation_bits))
+
+# --- Team colour legend: blue = offence, red = defence --------------------
+pos_abbr = meta.get("possessionTeam")
+def_abbr = meta.get("defensiveTeam")
+if pos_abbr and def_abbr:
+    off_name = dl.team_full_name(pos_abbr)
+    def_name = dl.team_full_name(def_abbr)
+    st.markdown(
+        f"<div style='display:flex;gap:1.5rem;align-items:center;"
+        f"font-size:0.95rem;margin:0.25rem 0 0.5rem'>"
+        f"<span><span style='display:inline-block;width:12px;height:12px;"
+        f"background:#1f77b4;border-radius:50%;margin-right:6px'></span>"
+        f"<b>Offense</b> — {off_name} ({pos_abbr})</span>"
+        f"<span><span style='display:inline-block;width:12px;height:12px;"
+        f"background:#d62728;border-radius:50%;margin-right:6px'></span>"
+        f"<b>Defense</b> — {def_name} ({def_abbr})</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
 # --- Pocket Integrity Score: the headline metric (Person C) ---------------
 pis = pocket.pocket_integrity_score(bundle)

@@ -57,23 +57,34 @@ def _pressure_color(distance: float) -> str:
     return f"rgb({r},{g},40)"
 
 
-def _frame_traces(frame_df: pd.DataFrame, pocket_fn=None, pressure_fn=None) -> list[go.Scatter]:
-    """Build the scatter traces for a single frame."""
-    off = frame_df[frame_df["team"] == "OFF"] if "OFF" in frame_df["team"].values \
-        else frame_df[(frame_df["team"] != "football") & (frame_df["team"].notna())]
-    # In real data, team is an abbreviation (e.g. "TB"/"DAL"), not OFF/DEF.
-    # We split by the two non-football teams; offense vs defense coloring can be
-    # refined once Person A tags possession. For now: football is brown, and the
-    # two teams get blue/red by first-seen order.
+def _frame_traces(frame_df: pd.DataFrame, pocket_fn=None, pressure_fn=None,
+                  possession_team=None, defensive_team=None) -> list[go.Scatter]:
+    """Build the scatter traces for a single frame.
+
+    If possession_team / defensive_team are given (from the bundle meta), colour
+    the offence blue and the defence red. Otherwise fall back to first-seen
+    order so the replay still works without possession info.
+    """
     traces = []
 
     ball = frame_df[frame_df["team"] == "football"]
     non_ball = frame_df[frame_df["team"] != "football"]
     teams = [t for t in non_ball["team"].dropna().unique()]
     color_for = {}
-    palette = [OFFENSE_COLOR, DEFENSE_COLOR, "#ff7f0e", "#9467bd"]
-    for i, t in enumerate(teams):
-        color_for[t] = palette[i % len(palette)]
+    if possession_team is not None and defensive_team is not None:
+        # Meaningful colours: offence = blue, defence = red.
+        for t in teams:
+            if t == possession_team:
+                color_for[t] = OFFENSE_COLOR
+            elif t == defensive_team:
+                color_for[t] = DEFENSE_COLOR
+            else:
+                color_for[t] = "#ff7f0e"
+    else:
+        # Fallback: blue/red by first-seen order (not guaranteed off/def).
+        palette = [OFFENSE_COLOR, DEFENSE_COLOR, "#ff7f0e", "#9467bd"]
+        for i, t in enumerate(teams):
+            color_for[t] = palette[i % len(palette)]
 
     for t in teams:
         grp = non_ball[non_ball["team"] == t]
@@ -160,11 +171,14 @@ def build_field_figure(bundle: dict, pocket_fn=None, pressure_fn=None) -> go.Fig
     """
     frames_df = bundle["frames"]
     meta = bundle.get("meta", {})
+    pos_team = meta.get("possessionTeam")
+    def_team = meta.get("defensiveTeam")
     frame_ids = sorted(frames_df["frameId"].unique())
 
     # Initial frame.
     first = frames_df[frames_df["frameId"] == frame_ids[0]]
-    fig = go.Figure(data=_frame_traces(first, pocket_fn, pressure_fn))
+    fig = go.Figure(data=_frame_traces(first, pocket_fn, pressure_fn,
+                                       pos_team, def_team))
 
     # Animation frames — each carries its own per-frame caption so the viewer
     # always knows how far into the play they are and what just happened.
@@ -172,7 +186,7 @@ def build_field_figure(bundle: dict, pocket_fn=None, pressure_fn=None) -> go.Fig
     for fid in frame_ids:
         fdf = frames_df[frames_df["frameId"] == fid]
         anim_frames.append(go.Frame(
-            data=_frame_traces(fdf, pocket_fn, pressure_fn),
+            data=_frame_traces(fdf, pocket_fn, pressure_fn, pos_team, def_team),
             name=str(fid),
             layout=go.Layout(
                 title=dict(text=_frame_label(fdf, meta, fid), x=0.5,
