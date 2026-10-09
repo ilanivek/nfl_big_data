@@ -14,8 +14,9 @@ import data_loader as dl
 import field
 import pocket
 
-st.set_page_config(page_title="NFL Pocket Replay", layout="wide")
-st.title("🏈 Pocket Replay — Pass Protection Visualizer")
+st.set_page_config(page_title="Pocket Watch", layout="wide")
+st.title("🏈 Pocket Watch")
+st.caption("Grading NFL pass protection, one snap at a time.")
 
 # --------------------------------------------------------------------------
 # Sidebar: data source + play selection

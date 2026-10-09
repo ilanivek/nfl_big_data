@@ -1,4 +1,4 @@
-# 🏈 Pocket Replay — Pass Protection Visualizer
+# 🏈 Pocket Watch — Grading NFL Pass Protection, One Snap at a Time
 
 An interactive tool that turns raw NFL player-tracking data into a readable story
 about **pass protection**: how well the offensive line kept rushers away from the
