@@ -79,6 +79,47 @@ def _offensive_players(frame_df: pd.DataFrame, blockers_only: bool = True) -> pd
     return non_ball
 
 
+# Role values (lowercased) for the QB and the pass rushers — the two sides of
+# the "how close is pressure" question.
+QB_ROLES = {"pass"}
+RUSHER_ROLES = {"pass rush"}
+
+
+def _players_by_role(frame_df: pd.DataFrame, wanted: set[str]) -> pd.DataFrame:
+    """Rows for one frame whose (lowercased) role is in `wanted`. Excludes ball."""
+    role_col = _role_column(frame_df)
+    if role_col is None:
+        return frame_df.iloc[0:0]
+    non_ball = frame_df[(frame_df["team"] != "football") & frame_df["team"].notna()]
+    role_norm = non_ball[role_col].astype(str).str.strip().str.lower()
+    return non_ball[role_norm.isin(wanted)]
+
+
+def qb_position(frame_df: pd.DataFrame):
+    """(x, y) of the QB this frame, or None if not identifiable."""
+    qb = _players_by_role(frame_df, QB_ROLES)
+    if qb.empty:
+        return None
+    row = qb.iloc[0]
+    return float(row["x"]), float(row["y"])
+
+
+def nearest_rusher_distance(frame_df: pd.DataFrame) -> float | None:
+    """Distance (yards) from the QB to the closest pass rusher this frame.
+
+    This is the real signal for pocket integrity: a big number means the QB is
+    protected; a small number means a rusher is bearing down. Returns None if
+    the QB or rushers can't be identified (e.g. mock without rusher roles).
+    """
+    qb = qb_position(frame_df)
+    rushers = _players_by_role(frame_df, RUSHER_ROLES)[["x", "y"]].dropna()
+    if qb is None or rushers.empty:
+        return None
+    qx, qy = qb
+    d = ((rushers["x"] - qx) ** 2 + (rushers["y"] - qy) ** 2) ** 0.5
+    return float(d.min())
+
+
 def pocket_shape(frame_df: pd.DataFrame) -> list[tuple[float, float]]:
     """Convex hull of the pass blockers — the visible 'pocket'.
 
@@ -143,45 +184,50 @@ def pocket_area_series(bundle: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def pressure_moment(bundle: dict, threshold: float = 10.0) -> dict | None:
-    """First frame where pocket area drops below `threshold` sq yds.
+def pressure_moment(bundle: dict, threshold: float | None = None) -> dict | None:
+    """First frame where a rusher gets within `threshold` yards of the QB.
 
-    This approximates the moment protection breaks down. Returns a dict with
-    frameId/seconds/area, or None if the pocket never collapses that far.
+    This is the moment pressure arrives. Returns a dict with
+    frameId/seconds/distance, or None if the QB is never pressured that close.
+    Defaults `threshold` to PRESSURE_RADIUS when not given.
     """
-    series = pocket_area_series(bundle)
-    collapsed = series[series["area"] < threshold]
-    if collapsed.empty:
+    if threshold is None:
+        threshold = PRESSURE_RADIUS
+    series = _post_snap_distance(bundle)
+    breached = series[series["distance"] < threshold]
+    if breached.empty:
         return None
-    row = collapsed.iloc[0]
-    return {"frameId": int(row["frameId"]), "seconds": row["seconds"], "area": row["area"]}
+    row = breached.iloc[0]
+    return {"frameId": int(row["frameId"]), "seconds": row["seconds"],
+            "distance": round(float(row["distance"]), 1)}
 
 
 # --------------------------------------------------------------------------
 # Pocket Integrity Score — the headline metric
 # --------------------------------------------------------------------------
-# A single 0-100 grade for how well the offensive line protected the QB on a
-# play. It blends three things a coach actually cares about, each scored 0-1
-# then weighted:
-#   1. TIME HELD   (45%) — how long the pocket survived before the throw/sack.
-#                  2.5s is "clean"; under ~1.5s is a quick loss.
-#   2. RETENTION   (35%) — pocket area at the throw vs. its post-snap peak.
-#                  A pocket that keeps its space protects better than one that
-#                  caves in, even if both last the same time.
-#   3. STABILITY   (20%) — how steadily it held vs. collapsing in a rush.
-#                  Measured as the worst (min) area as a share of the peak.
-# Weights are tunable; these are sensible hackathon defaults, not gospel.
+# A single 0-100 grade for how well the offensive line kept pass rushers away
+# from the QB. The signal is QB-to-nearest-rusher distance each frame — a
+# direct, physically meaningful measure of pressure (unlike raw pocket area,
+# which mostly reflects how spread out the linemen are). Three components:
+#   1. TIME CLEAN   (40%) — how long before the first rusher breaches the
+#                   pressure radius. Longer clean = better protection.
+#   2. SEPARATION   (35%) — average QB-to-nearest-rusher distance over the
+#                   play. More cushion = better.
+#   3. WORST CASE   (25%) — the closest any rusher got (minimum distance).
+#                   A rusher in the QB's lap is bad even if only briefly.
+# A play-outcome multiplier then caps plays that ended in a sack/pressure,
+# since protection that fails is a failure regardless of the geometry.
 
-SCORE_WEIGHTS = {"time": 0.45, "retention": 0.35, "stability": 0.20}
+SCORE_WEIGHTS = {"time": 0.40, "separation": 0.35, "worst": 0.25}
 
-# Time-held normalization: seconds that map to a "full marks" pocket.
-IDEAL_TIME_TO_THROW = 2.5
+# Distance thresholds (yards).
+PRESSURE_RADIUS = 2.0       # a rusher within this is "pressuring" the QB
+IDEAL_SEPARATION = 4.0      # avg separation that earns full marks
+IDEAL_TIME_CLEAN = 2.5      # seconds clean that earns full marks
 
 # Outcome multiplier applied to the blended score. Protection that ends in a
-# sack failed by definition, no matter how long it lasted, so we cap it hard.
-# A hit/hurry is a partial failure; a clean pass/scramble keeps full credit.
-#   S = sack, IN = interception (often pressure-driven), I = incomplete,
-#   C = complete, R = scramble.
+# sack failed by definition, no matter the geometry, so we cap it hard.
+#   S = sack, IN = interception, I = incomplete, C = complete, R = scramble.
 OUTCOME_MULTIPLIER = {
     "S": 0.35,   # sack — protection broke down
     "IN": 0.80,  # interception — not purely an OL failure
@@ -191,55 +237,76 @@ OUTCOME_MULTIPLIER = {
 }
 
 
-def _post_snap_series(bundle: dict) -> pd.DataFrame:
-    """Area series restricted to snap..throw (the window that matters)."""
-    series = pocket_area_series(bundle)
+def rusher_distance_series(bundle: dict) -> pd.DataFrame:
+    """QB-to-nearest-rusher distance at every frame.
+
+    Columns: [frameId, seconds, distance]. `distance` is NaN on frames where
+    the QB or rushers can't be identified.
+    """
+    frames = bundle["frames"]
+    snap = bundle["meta"].get("snap_frame")
+    rows = []
+    for fid in sorted(frames["frameId"].unique()):
+        fdf = frames[frames["frameId"] == fid]
+        secs = (fid - snap) / FRAMES_PER_SECOND if snap is not None else None
+        rows.append({"frameId": int(fid), "seconds": secs,
+                     "distance": nearest_rusher_distance(fdf)})
+    return pd.DataFrame(rows)
+
+
+def _post_snap_distance(bundle: dict) -> pd.DataFrame:
+    """Rusher-distance series restricted to snap..throw (the window that matters)."""
+    series = rusher_distance_series(bundle)
     meta = bundle["meta"]
     snap, throw = meta.get("snap_frame"), meta.get("throw_frame")
     if snap is not None:
         series = series[series["frameId"] >= snap]
     if throw is not None:
         series = series[series["frameId"] <= throw]
-    return series.reset_index(drop=True)
+    return series.dropna(subset=["distance"]).reset_index(drop=True)
 
 
 def pocket_integrity_score(bundle: dict) -> dict:
-    """Compute the 0-100 Pocket Integrity Score for a play.
+    """Compute the 0-100 Pocket Integrity Score from QB-to-rusher distance.
 
-    Returns a dict with the overall `score` plus the three component sub-scores
-    (0-100 each) and the raw numbers behind them, so the UI can show a
-    breakdown rather than an unexplained number.
+    Returns the overall `score`, the three component sub-scores (0-100), and
+    the raw numbers behind them so the UI can explain the grade.
     """
-    series = _post_snap_series(bundle)
-    if series.empty or series["area"].max() <= 0:
+    series = _post_snap_distance(bundle)
+    if series.empty:
         return {
             "score": None,
-            "components": {"time": None, "retention": None, "stability": None},
-            "detail": {"reason": "pocket not computable for this play"},
+            "components": {"time": None, "separation": None, "worst": None},
+            "detail": {"reason": "QB/rusher positions not available for this play"},
         }
 
-    peak = float(series["area"].max())
-    area_at_throw = float(series["area"].iloc[-1])
-    area_min = float(series["area"].min())
+    distances = series["distance"]
+    avg_sep = float(distances.mean())
+    min_sep = float(distances.min())
 
-    # 1. Time held (clamped 0..1 against the ideal).
-    ttt = time_to_throw(bundle["meta"])
-    time_component = min(ttt / IDEAL_TIME_TO_THROW, 1.0) if ttt is not None else 0.5
+    # 1. Time clean: seconds before the first pressure-radius breach.
+    breaches = series[series["distance"] < PRESSURE_RADIUS]
+    if breaches.empty:
+        time_clean = float(series["seconds"].iloc[-1])  # never breached
+    else:
+        time_clean = float(breaches["seconds"].iloc[0])
+    time_component = max(0.0, min(time_clean / IDEAL_TIME_CLEAN, 1.0))
 
-    # 2. Retention: area kept at the throw vs. the peak.
-    retention_component = max(0.0, min(area_at_throw / peak, 1.0))
+    # 2. Separation: average cushion vs. the ideal.
+    separation_component = max(0.0, min(avg_sep / IDEAL_SEPARATION, 1.0))
 
-    # 3. Stability: worst area vs. peak (penalizes a deep collapse mid-play).
-    stability_component = max(0.0, min(area_min / peak, 1.0))
+    # 3. Worst case: closest approach vs. the pressure radius. At/under the
+    #    radius scores 0; at/over the ideal separation scores 1.
+    span = IDEAL_SEPARATION - PRESSURE_RADIUS
+    worst_component = max(0.0, min((min_sep - PRESSURE_RADIUS) / span, 1.0))
 
     components01 = {
         "time": time_component,
-        "retention": retention_component,
-        "stability": stability_component,
+        "separation": separation_component,
+        "worst": worst_component,
     }
     blended = sum(SCORE_WEIGHTS[k] * v for k, v in components01.items())
 
-    # Apply the play-outcome multiplier so a sack can't score as "good" protection.
     outcome = bundle["meta"].get("passResult")
     mult = OUTCOME_MULTIPLIER.get(outcome, 1.0)
     overall = blended * mult
@@ -248,10 +315,9 @@ def pocket_integrity_score(bundle: dict) -> dict:
         "score": round(overall * 100, 1),
         "components": {k: round(v * 100, 1) for k, v in components01.items()},
         "detail": {
-            "time_to_throw_s": ttt,
-            "peak_area": round(peak, 1),
-            "area_at_throw": round(area_at_throw, 1),
-            "min_area": round(area_min, 1),
+            "time_clean_s": round(time_clean, 1),
+            "avg_separation_yd": round(avg_sep, 1),
+            "closest_approach_yd": round(min_sep, 1),
             "outcome": outcome,
             "outcome_multiplier": mult,
             "grade": _letter_grade(overall * 100),
@@ -272,20 +338,27 @@ def _letter_grade(score: float) -> str:
     return "F"
 
 
+# Distance that maps to "fully clear" (100) on the live integrity gauge.
+CLEAR_DISTANCE = 6.0
+
+
 def integrity_trace(bundle: dict) -> pd.DataFrame:
     """Per-frame 'live' pocket integrity (0-100), for a running gauge.
 
-    Integrity at a frame = current area as a percentage of the post-snap peak
-    area, so it starts near 100 right after the snap and falls as the pocket
-    collapses. Columns: [frameId, seconds, integrity].
+    Integrity = QB-to-nearest-rusher distance mapped onto 0-100: at or below the
+    pressure radius reads 0 (rusher on the QB), at or above CLEAR_DISTANCE reads
+    100 (QB clean). Starts high and falls as a rusher closes in — the physically
+    correct direction. Columns: [frameId, seconds, integrity].
     """
-    series = pocket_area_series(bundle)
-    post = _post_snap_series(bundle)
-    peak = float(post["area"].max()) if not post.empty and post["area"].max() > 0 else None
-    if peak is None:
-        series = series.assign(integrity=float("nan"))
-        return series[["frameId", "seconds", "integrity"]]
+    series = rusher_distance_series(bundle)
+    span = CLEAR_DISTANCE - PRESSURE_RADIUS
     series = series.assign(
-        integrity=(series["area"] / peak * 100).clip(lower=0, upper=100)
+        integrity=((series["distance"] - PRESSURE_RADIUS) / span * 100).clip(
+            lower=0, upper=100
+        )
+    )
+    # Short rolling median to tame single-frame tracking jitter.
+    series["integrity"] = (
+        series["integrity"].rolling(window=3, center=True, min_periods=1).median()
     )
     return series[["frameId", "seconds", "integrity"]]
