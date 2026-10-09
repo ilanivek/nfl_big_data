@@ -105,6 +105,17 @@ def _first_frame_for_events(frames: pd.DataFrame, events: set[str]) -> int | Non
     return int(hit["frameId"].min())
 
 
+def _canonical_role(role):
+    """Canonicalize a pff_role to Title Case ('Pass Block', 'Pass Rush', ...).
+
+    Real data is Title Case; the README documents lower-case. Normalizing here
+    means every consumer sees one consistent spelling. NaN/None passes through.
+    """
+    if role is None or (isinstance(role, float) and pd.isna(role)):
+        return role
+    return str(role).strip().title()
+
+
 def get_play_bundle(game_id: int, play_id: int) -> dict:
     """Produce the shared play bundle for one play. This is the hand-off."""
     tracking = load_tracking(game_id)
@@ -119,7 +130,12 @@ def get_play_bundle(game_id: int, play_id: int) -> dict:
     roles = load_pff_scouting()
     roles = roles[
         (roles["gameId"] == game_id) & (roles["playId"] == play_id)
-    ][["nflId", "pff_role"]]
+    ][["nflId", "pff_role"]].copy()
+    # The real CSV uses Title Case ("Pass Block", "Pass Rush", "Pass Route"),
+    # while the dataset README documents lower-case ("Pass block"). Normalize to
+    # a single canonical Title Case so downstream filters (Person C's pocket) and
+    # the mock bundle all agree regardless of the raw casing.
+    roles["pff_role"] = roles["pff_role"].map(_canonical_role)
     frames = frames.merge(roles, on="nflId", how="left")
 
     keep = [
@@ -209,14 +225,14 @@ def mock_bundle() -> dict:
             rows.append(dict(frameId=f, nflId=10 + i, team="OFF", jerseyNumber=70 + i,
                              x=ox - t * 2.5, y=oy - squeeze,
                              s=0.8, o=90, dir=270, event="None",
-                             pff_role="Pass block"))
+                             pff_role="Pass Block"))
 
         # Edge rushers loop in toward the QB from both sides.
         for j, (rx, ry) in enumerate(rush_start):
             rows.append(dict(frameId=f, nflId=20 + j, team="DEF", jerseyNumber=90 + j,
                              x=rx - t * 4.0, y=ry + (24.0 - ry) * t * 0.7,
                              s=2.0, o=270, dir=90, event="None",
-                             pff_role="Pass rush"))
+                             pff_role="Pass Rush"))
 
         # Ball tracks with the QB (no role — not a player).
         rows.append(dict(frameId=f, nflId=np.nan, team="football", jerseyNumber=np.nan,
