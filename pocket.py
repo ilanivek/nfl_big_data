@@ -20,17 +20,56 @@ import pandas as pd
 
 FRAMES_PER_SECOND = 10.0
 
+# Column names the bundle might use for a player's role (Person A will add one
+# of these when joining pffScoutingData). We check all common spellings so the
+# filter "just works" whatever Person A names it.
+ROLE_COLUMNS = ("role", "pff_role")
 
-def _offensive_players(frame_df: pd.DataFrame) -> pd.DataFrame:
-    """Best-effort offensive players for one frame (excludes ball)."""
+# pff_role values that identify a pass blocker — the players who form the pocket.
+BLOCKER_ROLES = {"Pass block", "Pass"}  # include the QB ("Pass"); drop him via QB_ONLY below if desired
+
+# Just the blockers (no QB), for the tightest pocket.
+PASS_BLOCK_ROLES = {"Pass block"}
+
+
+def _role_column(frame_df: pd.DataFrame) -> str | None:
+    """Return the name of the role column present in the frame, if any."""
+    for col in ROLE_COLUMNS:
+        if col in frame_df.columns:
+            return col
+    return None
+
+
+def _offensive_players(frame_df: pd.DataFrame, blockers_only: bool = True) -> pd.DataFrame:
+    """Players used to build the pocket hull, best available precision first.
+
+    Priority:
+      1. A role column (real data, once Person A joins pffScoutingData):
+         keep only pass blockers — the five O-linemen that actually form the
+         pocket. This is the correct, distortion-free input.
+      2. The mock bundle's explicit OFF/DEF tags: keep OFF.
+      3. Fallback: all non-ball players (least precise, but never crashes).
+
+    `blockers_only` keeps just the blockers (`Pass block`). Set False to also
+    include the QB, who sits inside the pocket.
+    """
     non_ball = frame_df[(frame_df["team"] != "football") & frame_df["team"].notna()]
-    # Mock bundle uses explicit OFF/DEF tags.
+
+    # 1. Best case: an explicit role column exists.
+    role_col = _role_column(frame_df)
+    if role_col is not None:
+        wanted = PASS_BLOCK_ROLES if blockers_only else BLOCKER_ROLES
+        blockers = non_ball[non_ball[role_col].isin(wanted)]
+        # Only trust the role filter if it actually found blockers; otherwise
+        # fall through so a sparse/odd play still renders something.
+        if len(blockers) >= 3:
+            return blockers
+
+    # 2. Mock bundle uses explicit OFF/DEF tags.
     if "OFF" in non_ball["team"].values:
         return non_ball[non_ball["team"] == "OFF"]
-    # Real data: team is an abbreviation. Without possession info here, fall back
-    # to the team with the most players clustered (refine once app.py passes the
-    # possession team through meta). For now return all non-ball players and let
-    # the hull approximate the line of scrimmage cluster.
+
+    # 3. Fallback: all non-ball players.
     return non_ball
 
 
@@ -79,3 +118,34 @@ def time_to_throw(meta: dict) -> float | None:
     if snap is None or throw is None:
         return None
     return (throw - snap) / FRAMES_PER_SECOND
+
+
+def pocket_area_series(bundle: dict) -> pd.DataFrame:
+    """Pocket area at every frame of the play.
+
+    Returns a DataFrame with columns [frameId, seconds, area], where `seconds`
+    is time since the snap (negative before the snap). Feed this to a line chart
+    to show the pocket collapsing over the course of the play.
+    """
+    frames = bundle["frames"]
+    snap = bundle["meta"].get("snap_frame")
+    rows = []
+    for fid in sorted(frames["frameId"].unique()):
+        fdf = frames[frames["frameId"] == fid]
+        secs = (fid - snap) / FRAMES_PER_SECOND if snap is not None else None
+        rows.append({"frameId": int(fid), "seconds": secs, "area": pocket_area(fdf)})
+    return pd.DataFrame(rows)
+
+
+def pressure_moment(bundle: dict, threshold: float = 10.0) -> dict | None:
+    """First frame where pocket area drops below `threshold` sq yds.
+
+    This approximates the moment protection breaks down. Returns a dict with
+    frameId/seconds/area, or None if the pocket never collapses that far.
+    """
+    series = pocket_area_series(bundle)
+    collapsed = series[series["area"] < threshold]
+    if collapsed.empty:
+        return None
+    row = collapsed.iloc[0]
+    return {"frameId": int(row["frameId"]), "seconds": row["seconds"], "area": row["area"]}

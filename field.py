@@ -100,32 +100,64 @@ def _frame_traces(frame_df: pd.DataFrame, pocket_fn=None) -> list[go.Scatter]:
     return traces
 
 
+def _frame_label(frame_df: pd.DataFrame, meta: dict, fid: int) -> str:
+    """Human-readable caption for a frame: time since snap + any event tag."""
+    snap = meta.get("snap_frame")
+    secs = f"{(fid - snap) / 10:+.1f}s" if snap is not None else f"frame {fid}"
+    # Surface a real event tag on this frame (ball_snap, pass_forward, qb_sack...).
+    events = [e for e in frame_df["event"].dropna().unique()
+              if e not in ("None", "none", "")]
+    event_txt = f" — {events[0]}" if events else ""
+    return f"{secs}{event_txt}"
+
+
 def build_field_figure(bundle: dict, pocket_fn=None) -> go.Figure:
     """Build the animated replay figure from a play bundle."""
     frames_df = bundle["frames"]
+    meta = bundle.get("meta", {})
     frame_ids = sorted(frames_df["frameId"].unique())
 
     # Initial frame.
     first = frames_df[frames_df["frameId"] == frame_ids[0]]
     fig = go.Figure(data=_frame_traces(first, pocket_fn))
 
-    # Animation frames.
+    # Animation frames — each carries its own per-frame caption so the viewer
+    # always knows how far into the play they are and what just happened.
     anim_frames = []
     for fid in frame_ids:
         fdf = frames_df[frames_df["frameId"] == fid]
-        anim_frames.append(go.Frame(data=_frame_traces(fdf, pocket_fn),
-                                     name=str(fid)))
+        anim_frames.append(go.Frame(
+            data=_frame_traces(fdf, pocket_fn),
+            name=str(fid),
+            layout=go.Layout(
+                title=dict(text=_frame_label(fdf, meta, fid), x=0.5,
+                           font=dict(size=14)),
+            ),
+        ))
     fig.frames = anim_frames
+
+    # Pre-compute the frames where snap/throw happen, to label the slider.
+    snap = meta.get("snap_frame")
+    throw = meta.get("throw_frame")
+
+    def _slider_label(fid: int) -> str:
+        if fid == snap:
+            return "SNAP"
+        if fid == throw:
+            return "THROW"
+        return f"{(fid - snap) / 10:.1f}" if snap is not None else str(fid)
 
     # Play/pause controls + slider.
     fig.update_layout(
         shapes=_field_shapes(),
+        title=dict(text=_frame_label(first, meta, frame_ids[0]), x=0.5,
+                   font=dict(size=14)),
         xaxis=dict(range=[0, FIELD_LENGTH], showgrid=False, zeroline=False,
                    visible=False, constrain="domain"),
         yaxis=dict(range=[0, FIELD_WIDTH], showgrid=False, zeroline=False,
                    visible=False, scaleanchor="x", scaleratio=1),
         plot_bgcolor="#2e7d32", paper_bgcolor="white",
-        margin=dict(l=10, r=10, t=10, b=10), height=400,
+        margin=dict(l=10, r=10, t=40, b=10), height=430,
         showlegend=False,
         updatemenus=[dict(
             type="buttons", showactive=False, x=0.05, y=1.15,
@@ -139,11 +171,12 @@ def build_field_figure(bundle: dict, pocket_fn=None) -> go.Figure:
             ],
         )],
         sliders=[dict(
-            steps=[dict(method="animate", label=str(fid),
+            steps=[dict(method="animate", label=_slider_label(fid),
                         args=[[str(fid)], dict(frame=dict(duration=0, redraw=True),
                                                mode="immediate")])
                    for fid in frame_ids],
-            x=0.05, len=0.9, y=0, currentvalue=dict(prefix="Frame "),
+            x=0.05, len=0.9, y=0,
+            currentvalue=dict(prefix="Time: ", suffix="s since snap"),
         )],
     )
     return fig

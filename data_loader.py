@@ -175,33 +175,52 @@ def mock_bundle() -> dict:
 
     n_frames = 40
     rows = []
-    # 5 offensive linemen in a rough arc, drifting slightly back.
-    ol_start = [(40, 20), (40, 22), (40, 24), (40, 26), (40, 28)]
+    # 5 offensive linemen set up in a CUP (arc), not a straight line — this is
+    # how a real O-line forms the pocket. The arc gives the convex hull real
+    # 2D area so the pocket is visible and measurable.
+    #   x = depth behind the line of scrimmage, y = across the field.
+    # Tackles (ends) sit slightly deeper than the center (middle), bowing the
+    # cup backward toward the QB.
+    ol_start = [
+        (41.0, 19.0),  # left tackle
+        (41.8, 21.5),  # left guard
+        (42.2, 24.0),  # center (shallowest, front of the cup)
+        (41.8, 26.5),  # right guard
+        (41.0, 29.0),  # right tackle
+    ]
     # QB behind the line.
-    qb_start = (37, 24)
-    # 2 rushers closing in.
-    rush_start = [(42, 21), (42, 27)]
+    qb_start = (38.0, 24.0)
+    # 2 edge rushers starting wide, collapsing inward toward the QB.
+    rush_start = [(44.0, 17.0), (44.0, 31.0)]
 
     for f in range(1, n_frames + 1):
-        t = f / n_frames
-        # QB drifts back a touch.
+        t = f / n_frames  # 0 -> 1 over the play
+
+        # QB drifts straight back a little.
         rows.append(dict(frameId=f, nflId=1, team="OFF", jerseyNumber=12,
-                         x=qb_start[0] - t * 2, y=qb_start[1], s=1.0, o=90, dir=270,
+                         x=qb_start[0] - t * 1.5, y=qb_start[1], s=1.0, o=90, dir=270,
                          event="ball_snap" if f == 5 else ("pass_forward" if f == 32 else "None"),
                          pff_role="Pass"))
+
+        # Linemen get pushed backward toward the QB AND squeezed inward in y,
+        # so the cup both retreats and narrows — the pocket collapses.
         for i, (ox, oy) in enumerate(ol_start):
+            squeeze = (oy - 24.0) * 0.35 * t   # pull each lineman toward center-y
             rows.append(dict(frameId=f, nflId=10 + i, team="OFF", jerseyNumber=70 + i,
-                             x=ox - t * 1.0, y=oy, s=0.8, o=90, dir=270, event="None",
+                             x=ox - t * 2.5, y=oy - squeeze,
+                             s=0.8, o=90, dir=270, event="None",
                              pff_role="Pass block"))
+
+        # Edge rushers loop in toward the QB from both sides.
         for j, (rx, ry) in enumerate(rush_start):
-            # rushers converge toward the QB
             rows.append(dict(frameId=f, nflId=20 + j, team="DEF", jerseyNumber=90 + j,
-                             x=rx - t * 3.0, y=ry + (24 - ry) * t * 0.6,
+                             x=rx - t * 4.0, y=ry + (24.0 - ry) * t * 0.7,
                              s=2.0, o=270, dir=90, event="None",
                              pff_role="Pass rush"))
-        # ball tracks with QB (no role — not a player)
+
+        # Ball tracks with the QB (no role — not a player).
         rows.append(dict(frameId=f, nflId=np.nan, team="football", jerseyNumber=np.nan,
-                         x=qb_start[0] - t * 2, y=qb_start[1], s=0.0, o=0, dir=0, event="None",
+                         x=qb_start[0] - t * 1.5, y=qb_start[1], s=0.0, o=0, dir=0, event="None",
                          pff_role=np.nan))
 
     frames = pd.DataFrame(rows)
